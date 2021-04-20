@@ -1,72 +1,52 @@
-use bencher::{benchmark_group, benchmark_main, Bencher};
-
-use deno_core::bin_op_sync;
-use deno_core::json_op_sync;
-use deno_core::v8;
+// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+use deno_core::error::AnyError;
+use deno_core::op_async;
+use deno_core::op_sync;
+use deno_core::serialize_op_result;
 use deno_core::JsRuntime;
 use deno_core::Op;
-use deno_core::OpResponse;
+use deno_core::OpState;
+use deno_core::ZeroCopyBuf;
 
-fn create_js_runtime() -> JsRuntime {
-  let mut runtime = JsRuntime::new(Default::default());
-  runtime.register_op("pi_bin", bin_op_sync(|_, _, _| Ok(314159)));
-  runtime.register_op("pi_json", json_op_sync(|_, _: (), _| Ok(314159)));
-  runtime
-    .register_op("nop", |_, _, _| Op::Sync(OpResponse::Value(Box::new(9))));
+use bench_util::bench_or_profile;
+use bench_util::bencher::{benchmark_group, Bencher};
+use bench_util::{bench_js_async, bench_js_sync};
 
-  // Init ops
-  runtime
-    .execute(
-      "init",
-      r#"
-      Deno.core.ops();
-      Deno.core.registerErrorClass('Error', Error);
-      const nopBuffer = new ArrayBuffer(10);
-      const nopView = new DataView(nopBuffer);
-    "#,
-    )
-    .unwrap();
+use std::cell::RefCell;
+use std::rc::Rc;
 
-  runtime
-}
-
-pub fn bench_runtime_js(b: &mut Bencher, src: &str) {
-  let mut runtime = create_js_runtime();
-  let context = runtime.global_context();
-  let scope = &mut v8::HandleScope::with_context(runtime.v8_isolate(), context);
-  let code = v8::String::new(scope, src).unwrap();
-  let script = v8::Script::compile(scope, code, None).unwrap();
-  b.iter(|| {
-    script.run(scope).unwrap();
+fn setup(rt: &mut JsRuntime) {
+  rt.register_op("pi_json", op_sync(|_, _: (), _| Ok(314159)));
+  rt.register_op("pi_async", op_async(op_pi_async));
+  rt.register_op("nop", |state, _, _| {
+    Op::Sync(serialize_op_result(Ok(9), state))
   });
 }
 
-fn bench_op_pi_bin(b: &mut Bencher) {
-  bench_runtime_js(
-    b,
-    r#"for(let i=0; i < 1e3; i++) {
-      Deno.core.binOpSync("pi_bin", 0, nopView);
-    }"#,
-  );
+// this is a function since async closures aren't stable
+async fn op_pi_async(
+  _: Rc<RefCell<OpState>>,
+  _: (),
+  _: Option<ZeroCopyBuf>,
+) -> Result<i64, AnyError> {
+  Ok(314159)
 }
 
 fn bench_op_pi_json(b: &mut Bencher) {
-  bench_runtime_js(
-    b,
-    r#"for(let i=0; i < 1e3; i++) {
-      Deno.core.jsonOpSync("pi_json", null);
-    }"#,
-  );
+  bench_js_sync(b, r#"Deno.core.opSync("pi_json");"#, setup);
 }
 
 fn bench_op_nop(b: &mut Bencher) {
-  bench_runtime_js(
+  bench_js_sync(
     b,
-    r#"for(let i=0; i < 1e3; i++) {
-      Deno.core.dispatchByName("nop", null, null, nopView);
-    }"#,
+    r#"Deno.core.dispatchByName("nop", null, null, null);"#,
+    setup,
   );
 }
 
-benchmark_group!(benches, bench_op_pi_bin, bench_op_pi_json, bench_op_nop);
-benchmark_main!(benches);
+fn bench_op_async(b: &mut Bencher) {
+  bench_js_async(b, r#"Deno.core.opAsync("pi_async");"#, setup);
+}
+
+benchmark_group!(benches, bench_op_pi_json, bench_op_nop, bench_op_async);
+bench_or_profile!(benches);
